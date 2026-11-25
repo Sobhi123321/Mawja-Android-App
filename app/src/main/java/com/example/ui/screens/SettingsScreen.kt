@@ -65,8 +65,7 @@ fun SettingsScreen(
     onSelectLanguage: (AppLanguage) -> Unit,
     onSelectTheme: (ThemeMode) -> Unit,
     onSelectConnectionMode: (ConnectionMode) -> Unit,
-    onSaveGatewayConfig: (GatewayConfig) -> Unit,
-    onTestGateway: () -> Unit,
+    onSaveAndTestGateway: (GatewayConfig) -> Unit,
     onToggleIntruderAlerts: (Boolean) -> Unit
 ) {
     val s = LocalAppStrings.current
@@ -78,6 +77,7 @@ fun SettingsScreen(
     var routerBrand by remember(prefs.gatewayConfig.routerBrand) { mutableStateOf(prefs.gatewayConfig.routerBrand) }
     var adminUser by remember(prefs.gatewayConfig.adminUsername) { mutableStateOf(prefs.gatewayConfig.adminUsername) }
     var adminPass by remember(prefs.gatewayConfig.adminPassword) { mutableStateOf(prefs.gatewayConfig.adminPassword) }
+    var useHttps by remember(prefs.gatewayConfig.useHttps) { mutableStateOf(prefs.gatewayConfig.useHttps) }
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -190,6 +190,15 @@ fun SettingsScreen(
                     )
 
                     ModeOptionRow(
+                        icon = Icons.Rounded.Router,
+                        title = s.modeMikrotikTitle,
+                        subtitle = s.modeMikrotikSubtitle,
+                        selected = prefs.connectionMode == ConnectionMode.MIKROTIK,
+                        onClick = { onSelectConnectionMode(ConnectionMode.MIKROTIK) },
+                        modifier = Modifier.testTag("mode_option_mikrotik")
+                    )
+
+                    ModeOptionRow(
                         icon = Icons.Rounded.WifiFind,
                         title = s.modeLocalTitle,
                         subtitle = s.modeLocalSubtitle,
@@ -277,6 +286,28 @@ fun SettingsScreen(
                         )
                     }
 
+                    if (prefs.connectionMode == ConnectionMode.MIKROTIK) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(s.useHttpsLabel, style = MaterialTheme.typography.titleSmall)
+                                Text(
+                                    text = s.mtHttpsHint,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Switch(
+                                checked = useHttps,
+                                onCheckedChange = { useHttps = it },
+                                modifier = Modifier.testTag("router_https_switch")
+                            )
+                        }
+                    }
+
                     // Test result pill
                     state.gatewayTestResult?.let { ok ->
                         Surface(
@@ -295,7 +326,7 @@ fun SettingsScreen(
                                     tint = if (ok) mawjaColors.healthyGreen else mawjaColors.blockedRed
                                 )
                                 Text(
-                                    text = if (ok) s.gatewayTestSuccess else s.gatewayTestFail,
+                                    text = state.gatewayTestDetail ?: if (ok) s.gatewayTestSuccess else s.gatewayTestFail,
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurface
                                 )
@@ -309,15 +340,15 @@ fun SettingsScreen(
                     ) {
                         Button(
                             onClick = {
-                                onSaveGatewayConfig(
+                                onSaveAndTestGateway(
                                     GatewayConfig(
                                         gatewayIp = gatewayIp,
                                         routerBrand = routerBrand,
                                         adminUsername = adminUser,
-                                        adminPassword = adminPass
+                                        adminPassword = adminPass,
+                                        useHttps = useHttps
                                     )
                                 )
-                                onTestGateway()
                             },
                             enabled = !state.isTestingGateway,
                             shape = RoundedCornerShape(14.dp),
@@ -356,7 +387,7 @@ fun SettingsScreen(
                     }
 
                     Text(
-                        text = s.localPolicyNote,
+                        text = if (prefs.connectionMode == ConnectionMode.MIKROTIK) s.mtPolicyNote else s.localPolicyNote,
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )

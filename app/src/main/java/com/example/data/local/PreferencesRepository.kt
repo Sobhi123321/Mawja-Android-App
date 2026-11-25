@@ -45,6 +45,7 @@ class PreferencesRepository(private val context: Context) {
         val ROUTER_BRAND = stringPreferencesKey("router_brand")
         val ADMIN_USER = stringPreferencesKey("admin_user")
         val ADMIN_PASS = stringPreferencesKey("admin_pass")
+        val ROUTER_HTTPS = booleanPreferencesKey("router_https")
     }
 
     val preferencesFlow: Flow<UserPreferences> = context.mawjaDataStore.data.map { prefs ->
@@ -71,7 +72,8 @@ class PreferencesRepository(private val context: Context) {
                 gatewayIp = prefs[Keys.GATEWAY_IP] ?: "192.168.1.1",
                 routerBrand = prefs[Keys.ROUTER_BRAND] ?: "Google Nest / Generic",
                 adminUsername = prefs[Keys.ADMIN_USER] ?: "admin",
-                adminPassword = prefs[Keys.ADMIN_PASS] ?: ""
+                adminPassword = prefs[Keys.ADMIN_PASS] ?: "",
+                useHttps = prefs[Keys.ROUTER_HTTPS] ?: true
             )
         )
     }
@@ -108,6 +110,7 @@ class PreferencesRepository(private val context: Context) {
             it[Keys.ROUTER_BRAND] = config.routerBrand.trim()
             it[Keys.ADMIN_USER] = config.adminUsername.trim()
             it[Keys.ADMIN_PASS] = config.adminPassword
+            it[Keys.ROUTER_HTTPS] = config.useHttps
         }
     }
 }

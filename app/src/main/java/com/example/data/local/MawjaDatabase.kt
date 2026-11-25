@@ -45,11 +45,11 @@ class MawjaTypeConverters {
 
 @Dao
 interface DeviceDao {
-    @Query("SELECT * FROM devices WHERE isDemoDevice = :isDemo ORDER BY isBlocked ASC, isTrusted ASC, currentDownloadMbps DESC, name ASC")
-    fun observeDevices(isDemo: Boolean): Flow<List<NetworkDevice>>
+    @Query("SELECT * FROM devices WHERE isDemoDevice = :isDemo AND isRouterDevice = :isRouter ORDER BY isBlocked ASC, isTrusted ASC, currentDownloadMbps DESC, name ASC")
+    fun observeDevices(isDemo: Boolean, isRouter: Boolean): Flow<List<NetworkDevice>>
 
-    @Query("SELECT * FROM devices WHERE isDemoDevice = :isDemo")
-    suspend fun getDevicesSnapshot(isDemo: Boolean): List<NetworkDevice>
+    @Query("SELECT * FROM devices WHERE isDemoDevice = :isDemo AND isRouterDevice = :isRouter")
+    suspend fun getDevicesSnapshot(isDemo: Boolean, isRouter: Boolean): List<NetworkDevice>
 
     @Query("SELECT * FROM devices WHERE macAddress = :mac LIMIT 1")
     suspend fun getByMac(mac: String): NetworkDevice?
@@ -134,7 +134,7 @@ interface SecurityAlertDao {
         SpeedTestRecord::class,
         SecurityAlert::class
     ],
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 @TypeConverters(MawjaTypeConverters::class)

@@ -21,6 +21,9 @@ import com.example.data.model.SpeedTestPhase
 import com.example.data.model.SpeedTestRecord
 import com.example.data.model.ThemeMode
 import com.example.data.network.DemoNetworkEngine
+import com.example.data.network.MikroTikException
+import com.example.data.network.MikroTikInfo
+import com.example.ui.i18n.stringsFor
 import com.example.data.repository.MawjaRepository
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
@@ -67,6 +70,8 @@ data class RouterUiState(
     val showScheduleDialog: Boolean = false,
     val gatewayTestResult: Boolean? = null,
     val isTestingGateway: Boolean = false,
+    val gatewayTestDetail: String? = null,
+    val routerError: String? = null,
     val snackbarMessage: SnackbarUndoMessage? = null
 ) {
     val selectedDevice: NetworkDevice?
@@ -111,7 +116,7 @@ data class RouterUiState(
         get() = schedules.count { it.isEnabled }
 
     val activeSamplesForChart: List<BandwidthSample>
-        get() = when (timeframe) {
+        get() = if (preferences.connectionMode != ConnectionMode.DEMO) liveSamples else when (timeframe) {
             BandwidthTimeframe.LIVE -> liveSamples
             BandwidthTimeframe.TODAY -> DemoNetworkEngine.buildHistoricalSamples(isToday = true)
             BandwidthTimeframe.WEEK -> DemoNetworkEngine.buildHistoricalSamples(isToday = false)
@@ -130,6 +135,12 @@ class RouterViewModel(application: Application) : AndroidViewModel(application) 
     private val pauseUntilFlow = MutableStateFlow<Long?>(null)
     private var speedTestJob: Job? = null
     private var lastLiveSamples = ArrayDeque<BandwidthSample>(24)
+
+    // MikroTik link state (only meaningful in ConnectionMode.MIKROTIK)
+    private var mikrotikInfo: MikroTikInfo? = null
+    private var mikrotikLinkOk: Boolean = true
+    private var mikrotikTick: Int = 0
+    private var mikrotikSyncing: Boolean = false
 
     private val modeFlow: StateFlow<ConnectionMode> = repository.preferencesFlow
         .map { it.connectionMode }
@@ -189,9 +200,22 @@ class RouterViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             modeFlow.collect { mode ->
                 lastLiveSamples.clear()
-                _uiState.update { it.copy(liveSamples = emptyList(), peakDownloadMbps = 0f, gatewayTestResult = null) }
+                mikrotikInfo = null
+                mikrotikLinkOk = true
+                mikrotikTick = 0
+                isAllPausedFlow.value = false
+                pauseUntilFlow.value = null
+                _uiState.update {
+                    it.copy(
+                        liveSamples = emptyList(),
+                        peakDownloadMbps = 0f,
+                        gatewayTestResult = null,
+                        gatewayTestDetail = null,
+                        routerError = null
+                    )
+                }
                 refreshGatewayStatus()
-                if (mode == ConnectionMode.LOCAL_LAN) {
+                if (mode != ConnectionMode.DEMO) {
                     scanLocalNetwork()
                 }
             }
@@ -224,6 +248,21 @@ class RouterViewModel(application: Application) : AndroidViewModel(application) 
                         repository.updateLiveDeviceMetrics(updatedDevices)
                     }
                     sample
+                } else if (mode == ConnectionMode.MIKROTIK) {
+                    val result = repository.sampleMikroTikThroughput(state.preferences.gatewayConfig)
+                    result.onSuccess {
+                        mikrotikLinkOk = true
+                    }.onFailure { e ->
+                        mikrotikLinkOk = false
+                        _uiState.update { it.copy(routerError = describeRouterError(e)) }
+                    }
+                    // Refresh the device list from the router every ~8 seconds, without blocking this loop.
+                    mikrotikTick++
+                    if (mikrotikTick % 8 == 1 && !mikrotikSyncing) {
+                        launch { syncMikroTikNow() }
+                    }
+                    val (d, u) = result.getOrDefault(Pair(0f, 0f))
+                    BandwidthSample(d, u)
                 } else {
                     val (rawDown, rawUp) = repository.localNetwork.sampleRealThroughputMbps()
                     val effectiveDown = if (isPaused) 0f else rawDown
@@ -278,15 +317,31 @@ class RouterViewModel(application: Application) : AndroidViewModel(application) 
         isPaused: Boolean,
         pauseUntil: Long?
     ): RouterGatewayStatus {
-        return if (mode == ConnectionMode.DEMO) {
-            DemoNetworkEngine.createDemoGatewayStatus(gatewayConfig.gatewayIp, isPaused)
-                .copy(pauseUntilMillis = pauseUntil)
-        } else {
-            repository.localNetwork.readRealGatewayStatus(
-                configuredGateway = gatewayConfig.gatewayIp,
-                routerModel = gatewayConfig.routerBrand,
-                isPaused = isPaused
-            ).copy(pauseUntilMillis = pauseUntil)
+        return when (mode) {
+            ConnectionMode.DEMO ->
+                DemoNetworkEngine.createDemoGatewayStatus(gatewayConfig.gatewayIp, isPaused)
+                    .copy(pauseUntilMillis = pauseUntil)
+            ConnectionMode.MIKROTIK -> {
+                val info = mikrotikInfo
+                repository.localNetwork.readRealGatewayStatus(
+                    configuredGateway = gatewayConfig.gatewayIp,
+                    routerModel = "MikroTik",
+                    isPaused = false
+                ).copy(
+                    gatewayIp = gatewayConfig.gatewayIp.trim()
+                        .removePrefix("http://").removePrefix("https://").substringBefore("/"),
+                    routerModel = if (info != null) "MikroTik ${info.boardName} (RouterOS ${info.version})" else "MikroTik",
+                    gatewayReachable = mikrotikLinkOk,
+                    uptimeHours = info?.uptimeHours ?: 1,
+                    pauseUntilMillis = null
+                )
+            }
+            ConnectionMode.LOCAL_LAN ->
+                repository.localNetwork.readRealGatewayStatus(
+                    configuredGateway = gatewayConfig.gatewayIp,
+                    routerModel = gatewayConfig.routerBrand,
+                    isPaused = isPaused
+                ).copy(pauseUntilMillis = pauseUntil)
         }
     }
 
@@ -324,10 +379,10 @@ class RouterViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun toggleConnectionMode() {
-        val next = if (_uiState.value.preferences.connectionMode == ConnectionMode.LOCAL_LAN) {
-            ConnectionMode.DEMO
+        val next = if (_uiState.value.preferences.connectionMode == ConnectionMode.DEMO) {
+            ConnectionMode.MIKROTIK
         } else {
-            ConnectionMode.LOCAL_LAN
+            ConnectionMode.DEMO
         }
         setConnectionMode(next)
     }
@@ -350,6 +405,30 @@ class RouterViewModel(application: Application) : AndroidViewModel(application) 
 
     fun toggleDeviceBlocked(device: NetworkDevice, blockedToast: String, unblockedToast: String) {
         val nextBlocked = !device.isBlocked
+        val prefs = _uiState.value.preferences
+        if (prefs.connectionMode == ConnectionMode.MIKROTIK) {
+            val s = stringsFor(prefs.language)
+            if (nextBlocked && device.isThisDevice) {
+                showSimpleMessage(s.mtSelfBlock)
+                return
+            }
+            viewModelScope.launch {
+                repository.setBlockedOnRouter(prefs.gatewayConfig, device, nextBlocked)
+                    .onSuccess {
+                        _uiState.update {
+                            it.copy(
+                                snackbarMessage = SnackbarUndoMessage(
+                                    text = if (nextBlocked) "$blockedToast: ${device.name}" else "$unblockedToast: ${device.name}",
+                                    undoDeviceMac = device.macAddress,
+                                    undoPreviousBlocked = device.isBlocked
+                                )
+                            )
+                        }
+                    }
+                    .onFailure { showSimpleMessage("${s.mtActionFailed}: ${describeRouterError(it)}") }
+            }
+            return
+        }
         viewModelScope.launch {
             repository.setDeviceBlocked(device.macAddress, nextBlocked)
             _uiState.update {
@@ -367,8 +446,21 @@ class RouterViewModel(application: Application) : AndroidViewModel(application) 
     fun undoLastBlockAction() {
         val msg = _uiState.value.snackbarMessage ?: return
         val mac = msg.undoDeviceMac ?: return
+        val prefs = _uiState.value.preferences
         viewModelScope.launch {
-            repository.setDeviceBlocked(mac, msg.undoPreviousBlocked)
+            if (prefs.connectionMode == ConnectionMode.MIKROTIK) {
+                val dev = _uiState.value.devices.firstOrNull { it.macAddress == mac }
+                if (dev != null) {
+                    val r = repository.setBlockedOnRouter(prefs.gatewayConfig, dev, msg.undoPreviousBlocked)
+                    if (r.isFailure) {
+                        val s = stringsFor(prefs.language)
+                        showSimpleMessage("${s.mtActionFailed}: ${describeRouterError(r.exceptionOrNull())}")
+                        return@launch
+                    }
+                }
+            } else {
+                repository.setDeviceBlocked(mac, msg.undoPreviousBlocked)
+            }
             _uiState.update { it.copy(snackbarMessage = null) }
         }
     }
@@ -386,6 +478,16 @@ class RouterViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun setDeviceSpeedLimits(mac: String, downMbps: Int, upMbps: Int) {
+        val prefs = _uiState.value.preferences
+        if (prefs.connectionMode == ConnectionMode.MIKROTIK) {
+            val dev = _uiState.value.devices.firstOrNull { it.macAddress == mac } ?: return
+            val s = stringsFor(prefs.language)
+            viewModelScope.launch {
+                repository.setLimitsOnRouter(prefs.gatewayConfig, dev, downMbps, upMbps)
+                    .onFailure { showSimpleMessage("${s.mtActionFailed}: ${describeRouterError(it)}") }
+            }
+            return
+        }
         viewModelScope.launch { repository.setDeviceSpeedLimits(mac, downMbps, upMbps) }
     }
 
@@ -401,19 +503,9 @@ class RouterViewModel(application: Application) : AndroidViewModel(application) 
             if (mode == ConnectionMode.LOCAL_LAN) {
                 refreshGatewayStatus()
                 val newUnknowns = repository.scanAndStoreLocalDevices(_uiState.value.gatewayStatus)
-                if (newUnknowns.isNotEmpty() && _uiState.value.preferences.intruderAlertsEnabled) {
-                    val lang = _uiState.value.preferences.language
-                    newUnknowns.forEach { dev ->
-                        repository.insertAlert(
-                            SecurityAlert(
-                                deviceMac = dev.macAddress,
-                                deviceName = dev.name,
-                                deviceIp = dev.ipAddress
-                            )
-                        )
-                        repository.notifications.postUnknownDeviceAlert(dev.name, dev.ipAddress, lang)
-                    }
-                }
+                raiseUnknownDeviceAlerts(newUnknowns)
+            } else if (mode == ConnectionMode.MIKROTIK) {
+                syncMikroTikNow()
             } else {
                 delay(700L)
             }
@@ -421,7 +513,57 @@ class RouterViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    private suspend fun raiseUnknownDeviceAlerts(devices: List<NetworkDevice>) {
+        if (devices.isEmpty() || !_uiState.value.preferences.intruderAlertsEnabled) return
+        val lang = _uiState.value.preferences.language
+        devices.forEach { dev ->
+            repository.insertAlert(
+                SecurityAlert(deviceMac = dev.macAddress, deviceName = dev.name, deviceIp = dev.ipAddress)
+            )
+            repository.notifications.postUnknownDeviceAlert(dev.name, dev.ipAddress, lang)
+        }
+    }
+
+    private suspend fun syncMikroTikNow() {
+        if (mikrotikSyncing) return
+        mikrotikSyncing = true
+        try {
+            val cfg = _uiState.value.preferences.gatewayConfig
+            val thisIp = repository.localNetwork
+                .readRealGatewayStatus(cfg.gatewayIp, "", false).localDeviceIp
+            repository.syncMikroTik(cfg, thisIp)
+                .onSuccess { sync ->
+                    mikrotikInfo = sync.info
+                    mikrotikLinkOk = true
+                    _uiState.update { it.copy(routerError = null) }
+                    raiseUnknownDeviceAlerts(sync.newUnknown)
+                }
+                .onFailure { e ->
+                    mikrotikLinkOk = false
+                    _uiState.update { it.copy(routerError = describeRouterError(e)) }
+                }
+        } finally {
+            mikrotikSyncing = false
+        }
+    }
+
+    private fun describeRouterError(e: Throwable?): String {
+        val s = stringsFor(_uiState.value.preferences.language)
+        val kind = (e as? MikroTikException)?.kind
+        return when (kind) {
+            MikroTikException.Kind.AUTH -> s.mtErrAuth
+            MikroTikException.Kind.UNREACHABLE -> s.mtErrUnreachable
+            MikroTikException.Kind.TLS -> s.mtErrTls
+            MikroTikException.Kind.SERVER -> "${s.mtErrServer}: ${e?.message}"
+            null -> e?.message ?: s.mtErrUnreachable
+        }
+    }
+
     fun togglePauseAll() {
+        if (_uiState.value.preferences.connectionMode == ConnectionMode.MIKROTIK) {
+            showSimpleMessage(stringsFor(_uiState.value.preferences.language).mtUnsupportedHere)
+            return
+        }
         val next = !isAllPausedFlow.value
         isAllPausedFlow.value = next
         if (!next) pauseUntilFlow.value = null
@@ -429,6 +571,10 @@ class RouterViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun pauseForMinutes(minutes: Int) {
+        if (_uiState.value.preferences.connectionMode == ConnectionMode.MIKROTIK) {
+            showSimpleMessage(stringsFor(_uiState.value.preferences.language).mtUnsupportedHere)
+            return
+        }
         isAllPausedFlow.value = true
         pauseUntilFlow.value = System.currentTimeMillis() + minutes * 60_000L
         refreshGatewayStatus()
@@ -466,24 +612,38 @@ class RouterViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     // Gateway Settings
-    fun updateGatewayConfig(config: GatewayConfig) {
+    /** Saves the settings, then tests them using exactly the values that were just saved. */
+    fun saveAndTestGateway(config: GatewayConfig) {
         viewModelScope.launch {
             repository.updateGatewayConfig(config)
-            refreshGatewayStatus()
-        }
-    }
-
-    fun testGatewayConnection() {
-        viewModelScope.launch {
-            _uiState.update { it.copy(isTestingGateway = true, gatewayTestResult = null) }
-            val mode = _uiState.value.preferences.connectionMode
-            val ok = if (mode == ConnectionMode.DEMO) {
-                delay(650L)
-                true
-            } else {
-                repository.testGateway(_uiState.value.preferences.gatewayConfig.gatewayIp)
+            _uiState.update { it.copy(isTestingGateway = true, gatewayTestResult = null, gatewayTestDetail = null) }
+            val prefs = _uiState.value.preferences
+            val mode = prefs.connectionMode
+            val s = stringsFor(prefs.language)
+            var ok: Boolean
+            var detail: String? = null
+            when (mode) {
+                ConnectionMode.DEMO -> {
+                    delay(650L)
+                    ok = true
+                }
+                ConnectionMode.MIKROTIK -> {
+                    val r = repository.testMikroTik(config)
+                    ok = r.isSuccess
+                    r.onSuccess { info ->
+                        mikrotikInfo = info
+                        mikrotikLinkOk = true
+                        detail = "${s.mtTestSuccess}: ${info.boardName} • RouterOS ${info.version}"
+                    }.onFailure { detail = describeRouterError(it) }
+                }
+                ConnectionMode.LOCAL_LAN -> ok = repository.testGateway(config.gatewayIp)
             }
-            _uiState.update { it.copy(isTestingGateway = false, gatewayTestResult = ok) }
+            refreshGatewayStatus()
+            _uiState.update { it.copy(isTestingGateway = false, gatewayTestResult = ok, gatewayTestDetail = detail) }
+            if (ok && mode == ConnectionMode.MIKROTIK) {
+                _uiState.update { it.copy(routerError = null) }
+                syncMikroTikNow()
+            }
         }
     }
 
@@ -501,11 +661,31 @@ class RouterViewModel(application: Application) : AndroidViewModel(application) 
 
     fun resolveAlert(alert: SecurityAlert, blockDevice: Boolean) {
         viewModelScope.launch {
+            val prefs = _uiState.value.preferences
+            if (prefs.connectionMode == ConnectionMode.MIKROTIK) {
+                val s = stringsFor(prefs.language)
+                val dev = _uiState.value.devices.firstOrNull { it.macAddress == alert.deviceMac }
+                if (dev != null && blockDevice && dev.isThisDevice) {
+                    showSimpleMessage(s.mtSelfBlock)
+                    return@launch
+                }
+                if (dev != null && dev.isBlocked != blockDevice) {
+                    val r = repository.setBlockedOnRouter(prefs.gatewayConfig, dev, blockDevice)
+                    if (r.isFailure) {
+                        showSimpleMessage("${s.mtActionFailed}: ${describeRouterError(r.exceptionOrNull())}")
+                        return@launch
+                    }
+                }
+            }
             repository.resolveAlert(alert.id, alert.deviceMac, blockDevice)
         }
     }
 
     fun simulateIntruderAlert() {
+        if (_uiState.value.preferences.connectionMode == ConnectionMode.MIKROTIK) {
+            showSimpleMessage(stringsFor(_uiState.value.preferences.language).mtUnsupportedHere)
+            return
+        }
         viewModelScope.launch {
             val intruder = DemoNetworkEngine.createRandomIntruderDevice().copy(
                 isDemoDevice = _uiState.value.preferences.connectionMode == ConnectionMode.DEMO
@@ -553,7 +733,7 @@ class RouterViewModel(application: Application) : AndroidViewModel(application) 
                 )
             }
 
-            if (mode == ConnectionMode.LOCAL_LAN) {
+            if (mode != ConnectionMode.DEMO) {
                 val res = repository.runRealSpeedTest(
                     onPingProgress = { ping, jitter, p ->
                         _uiState.update {

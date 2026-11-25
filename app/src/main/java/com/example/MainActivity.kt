@@ -221,7 +221,11 @@ fun MawjaAppRoot(viewModel: RouterViewModel) {
                                             modifier = Modifier.size(14.dp)
                                         )
                                         Text(
-                                            text = if (isDemo) s.modeDemoShort else s.modeLocalShort,
+                                            text = when (prefs.connectionMode) {
+                                                ConnectionMode.DEMO -> s.modeDemoShort
+                                                ConnectionMode.MIKROTIK -> s.modeMikrotikShort
+                                                ConnectionMode.LOCAL_LAN -> s.modeLocalShort
+                                            },
                                             style = MaterialTheme.typography.labelSmall,
                                             color = if (isDemo) MaterialTheme.colorScheme.tertiary else mawjaColors.healthyGreen
                                         )
@@ -386,8 +390,7 @@ fun MawjaAppRoot(viewModel: RouterViewModel) {
                                             onSelectLanguage = { viewModel.setLanguage(it) },
                                             onSelectTheme = { viewModel.setThemeMode(it) },
                                             onSelectConnectionMode = { viewModel.setConnectionMode(it) },
-                                            onSaveGatewayConfig = { viewModel.updateGatewayConfig(it) },
-                                            onTestGateway = { viewModel.testGatewayConnection() },
+                                            onSaveAndTestGateway = { viewModel.saveAndTestGateway(it) },
                                             onToggleIntruderAlerts = { viewModel.setIntruderAlertsEnabled(it) }
                                         )
                                     }

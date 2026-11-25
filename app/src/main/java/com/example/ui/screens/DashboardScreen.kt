@@ -267,7 +267,7 @@ fun DashboardScreen(
         }
 
         // Subtle Local LAN <-> Demo mode discovery card when in LOCAL_LAN mode
-        if (state.preferences.connectionMode == ConnectionMode.LOCAL_LAN) {
+        if (state.preferences.connectionMode != ConnectionMode.DEMO) {
             item(key = "local_mode_tip") {
                 Surface(
                     color = MaterialTheme.colorScheme.surfaceContainerLow,
@@ -299,6 +299,13 @@ fun DashboardScreen(
                                 style = MonoLabelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
+                            if (state.preferences.connectionMode == ConnectionMode.MIKROTIK && state.routerError != null) {
+                                Text(
+                                    text = state.routerError,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = mawjaColors.blockedRed
+                                )
+                            }
                         }
                         FilledTonalButton(
                             onClick = onSwitchToDemoMode,
@@ -340,8 +347,8 @@ fun DashboardScreen(
                         )
                     }
 
-                    // Timeframe selector pills
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    // Timeframe selector pills (history is only simulated, so it exists in demo mode only)
+                    if (state.preferences.connectionMode == ConnectionMode.DEMO) Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         listOf(
                             BandwidthTimeframe.LIVE to s.timeframeLive,
                             BandwidthTimeframe.TODAY to s.timeframeToday,

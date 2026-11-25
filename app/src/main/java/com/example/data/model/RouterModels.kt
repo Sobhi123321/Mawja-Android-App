@@ -16,7 +16,8 @@ enum class ThemeMode {
 
 enum class ConnectionMode {
     LOCAL_LAN,
-    DEMO
+    DEMO,
+    MIKROTIK
 }
 
 enum class DeviceCategory {
@@ -81,6 +82,7 @@ data class NetworkDevice(
     val isTrusted: Boolean = true,
     val isThisDevice: Boolean = false,
     val isDemoDevice: Boolean = false,
+    val isRouterDevice: Boolean = false, // true = read from the MikroTik router itself
     val downloadLimitMbps: Int = 0, // 0 = Unlimited
     val uploadLimitMbps: Int = 0,   // 0 = Unlimited
     val currentDownloadMbps: Float = 0f,
@@ -163,7 +165,8 @@ data class GatewayConfig(
     val gatewayIp: String = "192.168.1.1",
     val routerBrand: String = "Google Nest / Generic",
     val adminUsername: String = "admin",
-    val adminPassword: String = ""
+    val adminPassword: String = "",
+    val useHttps: Boolean = true
 )
 
 data class SpeedTestLiveState(

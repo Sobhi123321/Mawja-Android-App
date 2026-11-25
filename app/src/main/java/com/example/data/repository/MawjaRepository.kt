@@ -15,10 +15,15 @@ import com.example.data.model.SecurityAlert
 import com.example.data.model.SpeedTestRecord
 import com.example.data.model.ThemeMode
 import com.example.data.network.DemoNetworkEngine
+import com.example.data.network.MikroTikClient
+import com.example.data.network.MikroTikException
+import com.example.data.network.MikroTikInfo
 import com.example.data.network.LocalNetworkEngine
 import com.example.data.network.NotificationHelper
 import com.example.data.network.SpeedTestResult
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.withContext
 
 class MawjaRepository(context: Context) {
 
@@ -39,13 +44,16 @@ class MawjaRepository(context: Context) {
     val unreadAlertsCountFlow: Flow<Int> = alertDao.observeUnreadCount()
 
     fun observeDevices(mode: ConnectionMode): Flow<List<NetworkDevice>> =
-        deviceDao.observeDevices(isDemo = mode == ConnectionMode.DEMO)
+        deviceDao.observeDevices(
+            isDemo = mode == ConnectionMode.DEMO,
+            isRouter = mode == ConnectionMode.MIKROTIK
+        )
 
     suspend fun ensureSeededData() {
         if (scheduleDao.count() == 0) {
             DemoNetworkEngine.seedDefaultSchedules().forEach { scheduleDao.upsert(it) }
         }
-        val demoDevices = deviceDao.getDevicesSnapshot(isDemo = true)
+        val demoDevices = deviceDao.getDevicesSnapshot(isDemo = true, isRouter = false)
         if (demoDevices.isEmpty()) {
             val seeded = DemoNetworkEngine.seedDemoDevices()
             deviceDao.upsertAll(seeded)
@@ -63,7 +71,7 @@ class MawjaRepository(context: Context) {
     }
 
     suspend fun scanAndStoreLocalDevices(status: RouterGatewayStatus): List<NetworkDevice> {
-        val existing = deviceDao.getDevicesSnapshot(isDemo = false)
+        val existing = deviceDao.getDevicesSnapshot(isDemo = false, isRouter = false)
         val existingMacs = existing.map { it.macAddress }.toSet()
         val found = localNetwork.scanLocalSubnet(status, existing)
         if (found.isNotEmpty()) {
@@ -141,6 +149,124 @@ class MawjaRepository(context: Context) {
     suspend fun updateGatewayConfig(config: GatewayConfig) = preferences.updateGatewayConfig(config)
 
     suspend fun testGateway(ip: String): Boolean = localNetwork.testGatewayReachability(ip)
+
+    // ------------------------------------------------------------------ MikroTik
+
+    private var mtClient: MikroTikClient? = null
+    private var mtKey: String = ""
+    private var wanPrev: Triple<Long, Long, Long>? = null // rx bytes, tx bytes, elapsed ms
+
+    @Synchronized
+    private fun mikrotik(cfg: GatewayConfig): MikroTikClient {
+        val key = "${cfg.gatewayIp}|${cfg.adminUsername}|${cfg.adminPassword}|${cfg.useHttps}"
+        val current = mtClient
+        if (current != null && key == mtKey) return current
+        wanPrev = null
+        return MikroTikClient(cfg.gatewayIp, cfg.adminUsername, cfg.adminPassword, cfg.useHttps)
+            .also { mtClient = it; mtKey = key }
+    }
+
+    /** Runs a router call off the main thread; only router errors become a failed Result. */
+    private suspend fun <T> routerCall(block: () -> T): Result<T> = withContext(Dispatchers.IO) {
+        try {
+            Result.success(block())
+        } catch (e: MikroTikException) {
+            Result.failure(e)
+        } catch (e: IllegalArgumentException) {
+            Result.failure(MikroTikException(MikroTikException.Kind.UNREACHABLE, 0, e.message ?: "Invalid router settings"))
+        }
+    }
+
+    suspend fun testMikroTik(cfg: GatewayConfig): Result<MikroTikInfo> =
+        routerCall { mikrotik(cfg).fetchInfo() }
+
+    class MikroTikSync(val info: MikroTikInfo, val newUnknown: List<NetworkDevice>)
+
+    /**
+     * Reads the real device list, block list and speed limits from the router and mirrors them in
+     * the local database. The router is the single source of truth: nothing here is invented.
+     */
+    suspend fun syncMikroTik(cfg: GatewayConfig, thisDeviceIp: String): Result<MikroTikSync> {
+        val fetched = routerCall {
+            val c = mikrotik(cfg)
+            val info = c.fetchInfo()
+            Triple(info, c.fetchDevices(), Pair(c.fetchBlockedMacs(), c.fetchLimits()))
+        }
+        val (info, leases, rest) = fetched.getOrElse { return Result.failure(it) }
+        val (blocked, limits) = rest
+
+        val existing = deviceDao.getDevicesSnapshot(isDemo = false, isRouter = true).associateBy { it.macAddress }
+        val firstSync = existing.isEmpty()
+        val now = System.currentTimeMillis()
+        val seen = HashSet<String>()
+        val rows = ArrayList<NetworkDevice>()
+        val newUnknown = ArrayList<NetworkDevice>()
+
+        for (l in leases) {
+            seen.add(l.mac)
+            val prev = existing[l.mac]
+            val lim = limits[l.mac]
+            val device = NetworkDevice(
+                macAddress = l.mac,
+                name = prev?.name ?: l.hostName.ifBlank { "Device ${l.mac.takeLast(5)}" },
+                manufacturer = prev?.manufacturer ?: "Network device",
+                ipAddress = l.ip,
+                category = prev?.category ?: com.example.data.model.DeviceCategory.UNKNOWN,
+                profile = prev?.profile ?: com.example.data.model.DeviceProfile.UNKNOWN,
+                isOnline = l.isOnline,
+                isBlocked = l.mac in blocked,
+                // The very first sync is the baseline: everything already on the network is trusted.
+                isTrusted = prev?.isTrusted ?: firstSync,
+                isThisDevice = l.ip == thisDeviceIp,
+                isDemoDevice = false,
+                isRouterDevice = true,
+                downloadLimitMbps = lim?.downMbps ?: 0,
+                uploadLimitMbps = lim?.upMbps ?: 0,
+                currentDownloadMbps = 0f,
+                currentUploadMbps = 0f,
+                todayUsageGb = prev?.todayUsageGb ?: 0f,
+                signalStrengthDbm = prev?.signalStrengthDbm ?: -52,
+                lastSeenMillis = if (l.isOnline) now else (prev?.lastSeenMillis ?: now)
+            )
+            rows.add(device)
+            if (prev == null && !firstSync) newUnknown.add(device)
+        }
+        // Known devices the router no longer lists are shown as offline.
+        existing.values.filter { it.macAddress !in seen }.forEach {
+            rows.add(it.copy(isOnline = false, currentDownloadMbps = 0f, currentUploadMbps = 0f))
+        }
+        deviceDao.upsertAll(rows)
+        return Result.success(MikroTikSync(info, newUnknown))
+    }
+
+    /** Total internet throughput from the router's WAN counters, as (download, upload) in Mbps. */
+    suspend fun sampleMikroTikThroughput(cfg: GatewayConfig): Result<Pair<Float, Float>> {
+        val counters = routerCall { mikrotik(cfg).fetchWanCounters() }
+            .getOrElse { wanPrev = null; return Result.failure(it) }
+        val now = android.os.SystemClock.elapsedRealtime()
+        val prev = wanPrev
+        wanPrev = Triple(counters.first, counters.second, now)
+        if (prev == null) return Result.success(Pair(0f, 0f))
+        val dt = ((now - prev.third).coerceAtLeast(250L)) / 1000f
+        val down = ((counters.first - prev.first).coerceAtLeast(0L) * 8f / dt) / 1_000_000f
+        val up = ((counters.second - prev.second).coerceAtLeast(0L) * 8f / dt) / 1_000_000f
+        return Result.success(Pair(down.coerceIn(0f, 10_000f), up.coerceIn(0f, 10_000f)))
+    }
+
+    /** Blocks/unblocks on the router first; the local record only changes after the router confirms. */
+    suspend fun setBlockedOnRouter(cfg: GatewayConfig, device: NetworkDevice, blocked: Boolean): Result<Unit> {
+        val r = routerCall { mikrotik(cfg).setBlocked(device.macAddress, device.ipAddress, blocked) }
+        if (r.isSuccess) setDeviceBlocked(device.macAddress, blocked)
+        return r
+    }
+
+    suspend fun setLimitsOnRouter(cfg: GatewayConfig, device: NetworkDevice, downMbps: Int, upMbps: Int): Result<Unit> {
+        val r = routerCall {
+            mikrotik(cfg).setLimits(device.macAddress, device.ipAddress, downMbps.coerceAtLeast(0), upMbps.coerceAtLeast(0))
+        }
+        if (r.isSuccess) setDeviceSpeedLimits(device.macAddress, downMbps, upMbps)
+        return r
+    }
 
     suspend fun runRealSpeedTest(
         onPingProgress: (Int, Int, Float) -> Unit,
